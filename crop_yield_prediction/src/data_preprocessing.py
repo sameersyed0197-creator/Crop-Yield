@@ -130,26 +130,43 @@ def ndvi_curve_from_weather(rainfall_seq, temp_seq, crop_class, rng):
     return ndvi.astype(np.float32)
 
 
-def build_image_patch(ndvi_t, soil_n, soil_p, soil_k, soil_ph, rng):
+def build_image_patch(ndvi_t, soil_n, soil_p, soil_k, soil_ph, rng, health_score=0.5, n_stress_patches=0):
     """
     Build a (H, W, NUM_BANDS+2) image patch for one timestep.
     Bands: [Red, NIR, Blue, Green, SWIR, NDVI, EVI]
-    Derived from NDVI value + soil properties as spatial variation.
+    health_score: 0-1, high yield fields get brighter NDVI center gradient.
+    n_stress_patches: number of dark stress spots (pest/water damage) to inject.
     """
     H, W = IMAGE_HEIGHT, IMAGE_WIDTH
-    # NIR and Red derived from NDVI
-    nir = np.clip(ndvi_t * 0.8 + rng.normal(0, 0.02, (H, W)), 0.05, 1.0).astype(np.float32)
-    red = np.clip((1 - ndvi_t) * 0.25 + rng.normal(0, 0.01, (H, W)), 0.01, 0.5).astype(np.float32)
-    # Blue: correlated with humidity (passed via soil_ph proxy)
+
+    # --- Spatial NDVI gradient: healthy fields bright in center ---
+    cy, cx = H / 2.0, W / 2.0
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    max_dist = np.sqrt(cy ** 2 + cx ** 2)
+    # Center boost proportional to health_score
+    spatial_gradient = health_score * 0.25 * (1.0 - dist / (max_dist + 1e-8))
+    ndvi_spatial = np.clip(ndvi_t + spatial_gradient + rng.normal(0, 0.015, (H, W)), 0.05, 0.95).astype(np.float32)
+
+    # --- Stress patches: dark spots reduce local NDVI ---
+    for _ in range(n_stress_patches):
+        py = rng.integers(2, H - 6)
+        px = rng.integers(2, W - 6)
+        ph = rng.integers(4, 9)   # patch height 4-8 px
+        pw = rng.integers(4, 9)   # patch width  4-8 px
+        stress_val = rng.uniform(0.05, 0.20)   # dark = low NDVI
+        ndvi_spatial[py:py + ph, px:px + pw] = np.clip(
+                ndvi_spatial[py:py + ph, px:px + pw] * stress_val, 0.05, 0.95
+            )
+
+    # Derive spectral bands from spatially-varying NDVI
+    nir  = np.clip(ndvi_spatial * 0.8 + rng.normal(0, 0.02, (H, W)), 0.05, 1.0).astype(np.float32)
+    red  = np.clip((1 - ndvi_spatial) * 0.25 + rng.normal(0, 0.01, (H, W)), 0.01, 0.5).astype(np.float32)
     blue = np.clip(0.04 + soil_ph / 200.0 + rng.normal(0, 0.01, (H, W)), 0.01, 0.2).astype(np.float32)
-    # Green: average of NIR and Red
     green = np.clip((nir + red) / 2.0 + rng.normal(0, 0.01, (H, W)), 0.01, 0.8).astype(np.float32)
-    # SWIR: inversely related to soil moisture (proxy: soil_k)
-    swir = np.clip(0.1 + (1 - soil_k / 200.0) * 0.3 + rng.normal(0, 0.02, (H, W)), 0.01, 0.6).astype(np.float32)
-    # NDVI and EVI channels
-    ndvi_ch = np.full((H, W), ndvi_t, dtype=np.float32) + rng.normal(0, 0.01, (H, W)).astype(np.float32)
-    evi_ch  = np.clip(2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1 + 1e-8), -1, 1).astype(np.float32)
-    return np.stack([red, nir, blue, green, swir, ndvi_ch, evi_ch], axis=-1)
+    swir  = np.clip(0.1 + (1 - soil_k / 200.0) * 0.3 + rng.normal(0, 0.02, (H, W)), 0.01, 0.6).astype(np.float32)
+    evi_ch = np.clip(2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1 + 1e-8), -1, 1).astype(np.float32)
+    return np.stack([red, nir, blue, green, swir, ndvi_spatial, evi_ch], axis=-1)
 
 
 def compute_yield(crop_class, ndvi_seq, rainfall_total, avg_temp, soil_n, soil_p, rng):
@@ -257,13 +274,6 @@ def generate_and_save():
         # NDVI sequence derived from real weather
         ndvi_seq = ndvi_curve_from_weather(rain_seq, temp_seq, crop_class, rng)
 
-        # Build image patches for each timestep
-        for t in range(SEQUENCE_LENGTH):
-            images[i, t] = build_image_patch(
-                ndvi_seq[t], soil_n, soil_p, soil_k, soil_ph, rng
-            )
-            ndvi_store[i, t] = images[i, t, :, :, 5]  # NDVI channel
-
         # Weather matrix: [rainfall, temp_max, temp_min, humidity, solar_rad, soil_moisture]
         weather[i] = np.stack([
             rain_seq,
@@ -282,6 +292,21 @@ def generate_and_save():
             soil_n=soil_n, soil_p=soil_p,
             rng=rng
         )
+
+        # Field health score (0-1) derived from yield relative to crop base
+        health_score = float(np.clip(
+            (yields[i] - BASE_YIELDS[crop_class] * 0.5) / (BASE_YIELDS[crop_class] * 1.5), 0.0, 1.0
+        ))
+        # Stress patches: low-health fields get more stress spots
+        n_stress = int(rng.integers(0, 3)) if health_score > 0.5 else int(rng.integers(3, 8))
+
+        # Rebuild image patches with spatial signal now that yield is known
+        for t in range(SEQUENCE_LENGTH):
+            images[i, t] = build_image_patch(
+                ndvi_seq[t], soil_n, soil_p, soil_k, soil_ph, rng,
+                health_score=health_score, n_stress_patches=n_stress
+            )
+            ndvi_store[i, t] = images[i, t, :, :, 5]
 
         if (i + 1) % 100 == 0:
             print(f"  Processed {i+1}/{NUM_FIELDS} fields...")

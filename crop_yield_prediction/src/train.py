@@ -8,61 +8,57 @@ from sklearn.svm import SVR
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import keras
-from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from keras.callbacks import EarlyStopping, ModelCheckpoint
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     SEQUENCE_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH, NUM_BANDS, NUM_WEATHER_FEATURES,
-    BATCH_SIZE, EPOCHS, EARLY_STOPPING_PATIENCE, MODEL_DIR, RESULTS_DIR, RANDOM_SEED
+    BATCH_SIZE, EPOCHS, EARLY_STOPPING_PATIENCE, MODEL_DIR, RESULTS_DIR, RANDOM_SEED,
+    LEARNING_RATE
 )
 from src.data_preprocessing import load_data, split_data
 from src.feature_engineering import prepare_features
 from src.cnn_model import build_standalone_cnn
 from src.lstm_model import build_standalone_lstm
+from src.fusion_model import build_fusion_model, SliceChannel
 from src.utils import set_seeds, create_output_dirs, log_experiment
-from keras import layers, Model, Input
-import keras
 
 
-@keras.saving.register_keras_serializable()
-class SliceChannel(layers.Layer):
-    """Slices a single column from a 2-D tensor: output = input[:, index:index+1]."""
-    def __init__(self, index, **kwargs):
-        super().__init__(**kwargs)
-        self.index = index
-
-    def call(self, x):
-        return x[:, self.index:self.index + 1]
-
-    def get_config(self):
-        return {**super().get_config(), "index": self.index}
-
-
-
-def get_callbacks(model_name):
-    """Return standard Keras training callbacks."""
+def get_callbacks(model_name, lr_schedule=None):
+    """Return Keras training callbacks."""
     ckpt_path = os.path.join(MODEL_DIR, f"{model_name}_best.keras")
-    return [
+    cbs = [
         EarlyStopping(monitor="val_loss", patience=EARLY_STOPPING_PATIENCE,
                       restore_best_weights=True, verbose=1),
         ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=0),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
     ]
+    if lr_schedule is not None:
+        cbs.append(keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0))
+    return cbs
 
 
-def train_deep_model(model, X_train, y_train, X_val, y_val, model_name):
+def cosine_decay_schedule(total_epochs, lr_start, lr_min=1e-6):
+    """Returns a per-epoch cosine annealing LR function."""
+    def schedule(epoch, _lr):
+        cos = 0.5 * (1 + np.cos(np.pi * epoch / total_epochs))
+        return float(lr_min + (lr_start - lr_min) * cos)
+    return schedule
+
+
+def train_deep_model(model, X_train, y_train, X_val, y_val, model_name, lr_start=None):
     """Train a Keras model and return history dict."""
     save_path = os.path.join(MODEL_DIR, f"{model_name}.keras")
     if os.path.exists(save_path):
         print(f"[SKIP] {model_name} already trained at {save_path}")
         return {}
     print(f"\n{'='*50}\nTraining {model_name}...\n{'='*50}")
+    lr_sched = cosine_decay_schedule(EPOCHS, lr_start or LEARNING_RATE) if lr_start else None
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-        callbacks=get_callbacks(model_name),
+        callbacks=get_callbacks(model_name, lr_sched),
         verbose=1,
     )
     model.save(save_path)
@@ -80,6 +76,57 @@ def train_sklearn_model(model, X_train, y_train, model_name):
     model.fit(X_train, y_train)
     joblib.dump(model, save_path)
     print(f"Saved {model_name} to {MODEL_DIR}")
+
+
+def train_fusion_two_phase(img_tr, wx_tr, y_tr, img_val, wx_val, y_val,
+                           img_shape, wx_shape, histories):
+    """Two-phase fusion training: freeze CNN → warm LSTM, then joint fine-tune."""
+    fusion_path = os.path.join(MODEL_DIR, "fusion_model.keras")
+    if os.path.exists(fusion_path):
+        print(f"[SKIP] fusion_model already trained at {fusion_path}")
+        return
+
+    print(f"\n{'='*50}\nTraining fusion_model (two-phase)...\n{'='*50}")
+    fusion = build_fusion_model(img_shape, wx_shape)
+
+    # ── Phase 1: freeze CNN branch, warm up LSTM + fusion head (epochs 1-20) ──
+    for layer in fusion.layers:
+        if layer.name in ("td_cnn", "spatial_lstm", "cnn_proj", "cnn_residual"):
+            layer.trainable = False
+    fusion.compile(
+        optimizer=keras.optimizers.Adam(LEARNING_RATE),
+        loss="mse", metrics=["mae"]
+    )
+    print("Phase 1 (epochs 1-20): CNN frozen, warming LSTM + fusion head...")
+    p1_sched = cosine_decay_schedule(20, LEARNING_RATE)
+    fusion.fit(
+        [img_tr, wx_tr], y_tr,
+        validation_data=([img_val, wx_val], y_val),
+        epochs=20, batch_size=BATCH_SIZE,
+        callbacks=[keras.callbacks.LearningRateScheduler(p1_sched, verbose=0)],
+        verbose=1,
+    )
+
+    # ── Phase 2: unfreeze all, joint fine-tune with lr=0.0001 (epochs 21-50) ──
+    for layer in fusion.layers:
+        layer.trainable = True
+    LR_P2 = 0.0001
+    fusion.compile(
+        optimizer=keras.optimizers.Adam(LR_P2),
+        loss="mse", metrics=["mae"]
+    )
+    print("Phase 2 (epochs 21-100): all layers unfrozen, cosine LR from 1e-4...")
+    p2_sched = cosine_decay_schedule(80, LR_P2)
+    h = fusion.fit(
+        [img_tr, wx_tr], y_tr,
+        validation_data=([img_val, wx_val], y_val),
+        epochs=80, batch_size=BATCH_SIZE,
+        callbacks=get_callbacks("fusion_model", p2_sched),
+        verbose=1,
+    )
+    fusion.save(fusion_path)
+    print(f"Saved fusion_model to {MODEL_DIR}")
+    histories["fusion_model"] = {k: [float(v) for v in vals] for k, vals in h.history.items()}
 
 
 def main():
@@ -116,93 +163,26 @@ def main():
     img_shape = (SEQUENCE_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH, NUM_BANDS + 2)
     wx_shape  = (SEQUENCE_LENGTH, NUM_WEATHER_FEATURES)
 
-    # Load existing histories if present
     hist_path = os.path.join(RESULTS_DIR, "training_histories.json")
-    if os.path.exists(hist_path):
-        with open(hist_path) as f:
-            histories = json.load(f)
-    else:
-        histories = {}
+    histories = json.load(open(hist_path)) if os.path.exists(hist_path) else {}
 
     # 1. Standalone CNN
     cnn_model = build_standalone_cnn(img_shape)
-    h = train_deep_model(cnn_model, img_tr, y_tr, img_val, y_val, "standalone_cnn")
+    h = train_deep_model(cnn_model, img_tr, y_tr, img_val, y_val,
+                         "standalone_cnn", lr_start=LEARNING_RATE)
     if h:
         histories["standalone_cnn"] = h
 
     # 2. Standalone LSTM
     lstm_model = build_standalone_lstm(wx_shape)
-    h = train_deep_model(lstm_model, wx_tr, y_tr, wx_val, y_val, "standalone_lstm")
+    h = train_deep_model(lstm_model, wx_tr, y_tr, wx_val, y_val,
+                         "standalone_lstm", lr_start=LEARNING_RATE)
     if h:
         histories["standalone_lstm"] = h
 
-    # 3. Fusion model — attention-gated, two-phase training
-    fusion_path = os.path.join(MODEL_DIR, "fusion_model.keras")
-    if os.path.exists(fusion_path):
-        print(f"[SKIP] fusion_model already trained at {fusion_path}")
-    else:
-        print(f"\n{'='*50}\nTraining fusion_model...\n{'='*50}")
-        T, H, W, C = img_shape
-        _, F = wx_shape
-
-        def _cnn_enc():
-            inp = Input(shape=(H, W, C))
-            x = layers.Conv2D(32, 3, padding="same")(inp)
-            x = layers.BatchNormalization()(x); x = layers.ReLU()(x); x = layers.MaxPooling2D(2)(x)
-            x = layers.Conv2D(64, 3, padding="same")(x)
-            x = layers.BatchNormalization()(x); x = layers.ReLU()(x); x = layers.MaxPooling2D(2)(x)
-            x = layers.Conv2D(128, 3, padding="same")(x)
-            x = layers.BatchNormalization()(x); x = layers.ReLU()(x)
-            x = layers.GlobalAveragePooling2D()(x)
-            return Model(inp, layers.Dense(128, activation="relu")(x), name="cnn_enc")
-
-        from config import DROPOUT_RATE, LEARNING_RATE
-        img_inp = Input(shape=img_shape, name="image_input")
-        sp_seq  = layers.TimeDistributed(_cnn_enc(), name="td_cnn")(img_inp)
-        sp_feat = layers.LSTM(64, name="spatial_lstm")(sp_seq)
-        sp_proj = layers.Dense(64, activation="relu", name="cnn_proj")(sp_feat)
-
-        wx_inp  = Input(shape=wx_shape, name="weather_input")
-        x2      = layers.Masking(mask_value=0.0)(wx_inp)
-        x2      = layers.LSTM(128, return_sequences=True)(x2)
-        x2      = layers.Dropout(DROPOUT_RATE)(x2)
-        x2      = layers.LSTM(64)(x2)
-        x2      = layers.Dropout(DROPOUT_RATE)(x2)
-        wx_feat = layers.Dense(64, activation="relu", name="lstm_proj")(x2)
-
-        gate_in = layers.Concatenate(name="gate_input")([sp_proj, wx_feat])
-        gate    = layers.Dense(2, activation="softmax", name="branch_gate")(gate_in)
-        cnn_w   = SliceChannel(0, name="cnn_weight")(gate)
-        lstm_w  = SliceChannel(1, name="lstm_weight")(gate)
-        fused   = layers.Concatenate(name="fusion")(
-            [layers.Multiply(name="cnn_scaled")([sp_proj, cnn_w]),
-             layers.Multiply(name="lstm_scaled")([wx_feat, lstm_w])]
-        )
-        x = layers.Dense(128, activation="relu")(fused)
-        x = layers.Dropout(DROPOUT_RATE)(x)
-        x = layers.Dense(64, activation="relu")(x)
-        out = layers.Dense(1, activation="linear", name="yield_output")(x)
-        fusion = Model(inputs=[img_inp, wx_inp], outputs=out, name="fusion_model")
-
-        # Phase 1: freeze CNN branch, warm up LSTM + gate
-        for layer in fusion.layers:
-            if layer.name in ("td_cnn", "spatial_lstm", "cnn_proj"):
-                layer.trainable = False
-        fusion.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE), loss="mse", metrics=["mae"])
-        print("Phase 1: warming up LSTM branch (CNN frozen)...")
-        fusion.fit([img_tr, wx_tr], y_tr, validation_data=([img_val, wx_val], y_val),
-                   epochs=20, batch_size=BATCH_SIZE, verbose=1)
-
-        # Phase 2: unfreeze all, joint fine-tune at lower LR
-        for layer in fusion.layers:
-            layer.trainable = True
-        fusion.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE * 0.3), loss="mse", metrics=["mae"])
-        print("Phase 2: joint fine-tuning (all layers unfrozen)...")
-        h = fusion.fit([img_tr, wx_tr], y_tr, validation_data=([img_val, wx_val], y_val),
-                       epochs=EPOCHS, batch_size=BATCH_SIZE,
-                       callbacks=get_callbacks("fusion_model"), verbose=1)
-        fusion.save(fusion_path)
-        histories["fusion_model"] = {k: [float(v) for v in vals] for k, vals in h.history.items()}
+    # 3. Fusion — two-phase
+    train_fusion_two_phase(img_tr, wx_tr, y_tr, img_val, wx_val, y_val,
+                           img_shape, wx_shape, histories)
 
     # 4. Random Forest
     rf = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
@@ -212,14 +192,13 @@ def main():
     svr = SVR(kernel="rbf", C=10, epsilon=0.1)
     train_sklearn_model(svr, ml_tr, y_tr, "svr")
 
-    # Save histories
     os.makedirs(RESULTS_DIR, exist_ok=True)
     with open(hist_path, "w") as f:
         json.dump(histories, f, indent=2)
     print(f"\nTraining histories saved to {hist_path}")
 
     log_experiment(
-        {"epochs": EPOCHS, "batch_size": BATCH_SIZE, "seed": RANDOM_SEED},
+        {"epochs": EPOCHS, "batch_size": BATCH_SIZE, "lr": LEARNING_RATE, "seed": RANDOM_SEED},
         {"models_trained": list(histories.keys())}
     )
     print("\nAll models trained successfully.")
