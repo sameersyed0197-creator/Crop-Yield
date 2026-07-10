@@ -5,6 +5,7 @@ import numpy as np
 import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR
+from sklearn.metrics import r2_score
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import keras
@@ -20,113 +21,133 @@ from src.data_preprocessing import load_data, split_data
 from src.feature_engineering import prepare_features
 from src.cnn_model import build_standalone_cnn
 from src.lstm_model import build_standalone_lstm
-from src.fusion_model import build_fusion_model, SliceChannel
-from src.utils import set_seeds, create_output_dirs, log_experiment
+from src.fusion_model import build_fusion_model
+from src.utils import set_seeds, create_output_dirs, log_experiment, compute_metrics, format_results_table
 
 
-def get_callbacks(model_name, lr_schedule=None):
-    """Return Keras training callbacks."""
-    ckpt_path = os.path.join(MODEL_DIR, f"{model_name}_best.keras")
-    cbs = [
-        EarlyStopping(monitor="val_loss", patience=EARLY_STOPPING_PATIENCE,
-                      restore_best_weights=True, verbose=1),
-        ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=0),
-    ]
-    if lr_schedule is not None:
-        cbs.append(keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0))
-    return cbs
-
-
-def cosine_decay_schedule(total_epochs, lr_start, lr_min=1e-6):
-    """Returns a per-epoch cosine annealing LR function."""
+def cosine_schedule(total_epochs, lr_start, lr_min=1e-6):
     def schedule(epoch, _lr):
         cos = 0.5 * (1 + np.cos(np.pi * epoch / total_epochs))
         return float(lr_min + (lr_start - lr_min) * cos)
     return schedule
 
 
-def train_deep_model(model, X_train, y_train, X_val, y_val, model_name, lr_start=None):
-    """Train a Keras model and return history dict."""
+def get_callbacks(model_name, lr_sched=None, patience=None):
+    ckpt = os.path.join(MODEL_DIR, f"{model_name}_best.keras")
+    cbs = [
+        EarlyStopping(monitor="val_loss",
+                      patience=patience or EARLY_STOPPING_PATIENCE,
+                      restore_best_weights=True, verbose=1),
+        ModelCheckpoint(ckpt, monitor="val_loss", save_best_only=True, verbose=0),
+    ]
+    if lr_sched:
+        cbs.append(keras.callbacks.LearningRateScheduler(lr_sched, verbose=0))
+    return cbs
+
+
+def train_deep_model(model, X_tr, y_tr, X_val, y_val, model_name, lr_start=None):
     save_path = os.path.join(MODEL_DIR, f"{model_name}.keras")
     if os.path.exists(save_path):
-        print(f"[SKIP] {model_name} already trained at {save_path}")
+        print(f"[SKIP] {model_name} already trained.")
         return {}
     print(f"\n{'='*50}\nTraining {model_name}...\n{'='*50}")
-    lr_sched = cosine_decay_schedule(EPOCHS, lr_start or LEARNING_RATE) if lr_start else None
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=get_callbacks(model_name, lr_sched),
-        verbose=1,
-    )
+    lr_s = cosine_schedule(EPOCHS, lr_start or LEARNING_RATE) if lr_start else None
+    h = model.fit(X_tr, y_tr, validation_data=(X_val, y_val),
+                  epochs=EPOCHS, batch_size=BATCH_SIZE,
+                  callbacks=get_callbacks(model_name, lr_s), verbose=1)
     model.save(save_path)
-    print(f"Saved {model_name} to {MODEL_DIR}")
-    return {k: [float(v) for v in vals] for k, vals in history.history.items()}
+    print(f"Saved {model_name}")
+    return {k: [float(v) for v in vals] for k, vals in h.history.items()}
 
 
-def train_sklearn_model(model, X_train, y_train, model_name):
-    """Train a scikit-learn model and save with joblib."""
+def train_sklearn_model(model, X_tr, y_tr, model_name):
     save_path = os.path.join(MODEL_DIR, f"{model_name}.pkl")
     if os.path.exists(save_path):
-        print(f"[SKIP] {model_name} already trained at {save_path}")
+        print(f"[SKIP] {model_name} already trained.")
         return
     print(f"\nTraining {model_name}...")
-    model.fit(X_train, y_train)
+    model.fit(X_tr, y_tr)
     joblib.dump(model, save_path)
-    print(f"Saved {model_name} to {MODEL_DIR}")
+    print(f"Saved {model_name}")
 
 
 def train_fusion_two_phase(img_tr, wx_tr, y_tr, img_val, wx_val, y_val,
                            img_shape, wx_shape, histories):
-    """Two-phase fusion training: freeze CNN → warm LSTM, then joint fine-tune."""
     fusion_path = os.path.join(MODEL_DIR, "fusion_model.keras")
     if os.path.exists(fusion_path):
-        print(f"[SKIP] fusion_model already trained at {fusion_path}")
+        print("[SKIP] fusion_model already trained.")
         return
 
-    print(f"\n{'='*50}\nTraining fusion_model (two-phase)...\n{'='*50}")
+    print(f"\n{'='*50}\nTraining fusion_model (two-phase)\n{'='*50}")
     fusion = build_fusion_model(img_shape, wx_shape)
 
-    # ── Phase 1: freeze CNN branch, warm up LSTM + fusion head (epochs 1-20) ──
+    # ── Phase 1: freeze td_cnn, train LSTM + attention + head (30 epochs, lr=0.001) ──
     for layer in fusion.layers:
-        if layer.name in ("td_cnn", "spatial_lstm", "cnn_proj", "cnn_residual"):
+        if "td_cnn" in layer.name:
             layer.trainable = False
-    fusion.compile(
-        optimizer=keras.optimizers.Adam(LEARNING_RATE),
-        loss="mse", metrics=["mae"]
-    )
-    print("Phase 1 (epochs 1-20): CNN frozen, warming LSTM + fusion head...")
-    p1_sched = cosine_decay_schedule(20, LEARNING_RATE)
+    fusion.compile(optimizer=keras.optimizers.Adam(0.001), loss="mse", metrics=["mae"])
+    print("\nPhase 1 (30 ep, lr=0.001): CNN frozen — warming LSTM + fusion head ...")
     fusion.fit(
         [img_tr, wx_tr], y_tr,
         validation_data=([img_val, wx_val], y_val),
-        epochs=20, batch_size=BATCH_SIZE,
-        callbacks=[keras.callbacks.LearningRateScheduler(p1_sched, verbose=0)],
+        epochs=30, batch_size=BATCH_SIZE,
+        callbacks=[EarlyStopping(monitor="val_loss", patience=8,
+                                 restore_best_weights=True, verbose=1),
+                   keras.callbacks.LearningRateScheduler(cosine_schedule(30, 0.001), verbose=0)],
         verbose=1,
     )
 
-    # ── Phase 2: unfreeze all, joint fine-tune with lr=0.0001 (epochs 21-50) ──
+    # ── Phase 2: unfreeze all, joint fine-tune (70 epochs, lr=0.0001) ──
     for layer in fusion.layers:
         layer.trainable = True
-    LR_P2 = 0.0001
-    fusion.compile(
-        optimizer=keras.optimizers.Adam(LR_P2),
-        loss="mse", metrics=["mae"]
-    )
-    print("Phase 2 (epochs 21-100): all layers unfrozen, cosine LR from 1e-4...")
-    p2_sched = cosine_decay_schedule(80, LR_P2)
+    fusion.compile(optimizer=keras.optimizers.Adam(0.0001), loss="mse", metrics=["mae"])
+    print("\nPhase 2 (70 ep, lr=0.0001): all layers unfrozen — joint fine-tune ...")
     h = fusion.fit(
         [img_tr, wx_tr], y_tr,
         validation_data=([img_val, wx_val], y_val),
-        epochs=80, batch_size=BATCH_SIZE,
-        callbacks=get_callbacks("fusion_model", p2_sched),
+        epochs=70, batch_size=BATCH_SIZE,
+        callbacks=get_callbacks("fusion_model",
+                                lr_sched=cosine_schedule(70, 0.0001),
+                                patience=15),
         verbose=1,
     )
     fusion.save(fusion_path)
-    print(f"Saved fusion_model to {MODEL_DIR}")
+    print(f"Saved fusion_model")
     histories["fusion_model"] = {k: [float(v) for v in vals] for k, vals in h.history.items()}
+
+
+def print_comparison_table(models_dict, img_te, wx_te, ml_te, y_te):
+    """Load all models, predict on test set, print final comparison table."""
+    print("\n" + "=" * 62)
+    print(f"{'Model':<22} {'RMSE':>8} {'MAE':>8} {'R²':>8} {'MAPE%':>8}")
+    print("-" * 62)
+    results = {}
+    order = ["standalone_cnn", "standalone_lstm", "fusion_model", "random_forest", "svr"]
+    for name in order:
+        path_k = os.path.join(MODEL_DIR, f"{name}.keras")
+        path_p = os.path.join(MODEL_DIR, f"{name}.pkl")
+        try:
+            if os.path.exists(path_k):
+                m = keras.models.load_model(path_k, safe_mode=False)
+                if name == "fusion_model":
+                    pred = m.predict([img_te, wx_te], verbose=0).flatten()
+                elif name == "standalone_cnn":
+                    pred = m.predict(img_te, verbose=0).flatten()
+                else:
+                    pred = m.predict(wx_te, verbose=0).flatten()
+            elif os.path.exists(path_p):
+                m = joblib.load(path_p)
+                pred = m.predict(ml_te)
+            else:
+                continue
+            metrics = compute_metrics(y_te, pred)
+            results[name] = metrics
+            print(f"{name:<22} {metrics['RMSE']:>8.4f} {metrics['MAE']:>8.4f} "
+                  f"{metrics['R2']:>8.4f} {metrics['MAPE']:>8.2f}")
+        except Exception as e:
+            print(f"{name:<22} ERROR: {e}")
+    print("=" * 62)
+    return results
 
 
 def main():
@@ -156,9 +177,9 @@ def main():
 
     img_val, wx_val, ml_val = scale_split(splits["val"])
     img_te,  wx_te,  ml_te  = scale_split(splits["test"])
-
     y_tr  = splits["train"]["yields"]
     y_val = splits["val"]["yields"]
+    y_te  = splits["test"]["yields"]
 
     img_shape = (SEQUENCE_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH, NUM_BANDS + 2)
     wx_shape  = (SEQUENCE_LENGTH, NUM_WEATHER_FEATURES)
@@ -185,7 +206,8 @@ def main():
                            img_shape, wx_shape, histories)
 
     # 4. Random Forest
-    rf = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
+    rf = RandomForestRegressor(n_estimators=300, max_features="sqrt",
+                               random_state=RANDOM_SEED, n_jobs=-1)
     train_sklearn_model(rf, ml_tr, y_tr, "random_forest")
 
     # 5. SVR
@@ -195,13 +217,22 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     with open(hist_path, "w") as f:
         json.dump(histories, f, indent=2)
-    print(f"\nTraining histories saved to {hist_path}")
 
     log_experiment(
         {"epochs": EPOCHS, "batch_size": BATCH_SIZE, "lr": LEARNING_RATE, "seed": RANDOM_SEED},
         {"models_trained": list(histories.keys())}
     )
-    print("\nAll models trained successfully.")
+
+    print("\n[Final] Comparison table on held-out test set:")
+    results = print_comparison_table({}, img_te, wx_te, ml_te, y_te)
+
+    # Save results CSV
+    import pandas as pd
+    df_res = pd.DataFrame(results).T
+    df_res.index.name = "Model"
+    df_res.to_csv(os.path.join(RESULTS_DIR, "all_model_results.csv"))
+    print(f"\nResults saved to {RESULTS_DIR}/all_model_results.csv")
+    print("All models trained successfully.")
 
 
 if __name__ == "__main__":
