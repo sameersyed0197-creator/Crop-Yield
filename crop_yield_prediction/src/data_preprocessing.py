@@ -127,21 +127,24 @@ def generate_and_save():
             ndvi_store[i, t] = patch[:, :, 5]
 
         # Yield — tied to BOTH image signal (field_health, num_stress) and weather
-        total_rain = weather[i, :, 0].sum()
-        peak_ndvi  = ndvi_store[i].mean(axis=(1, 2)).max()
-        avg_temp   = weather[i, :, 1].mean()
+        total_rain  = weather[i, :, 0].sum()
+        peak_ndvi   = ndvi_store[i].mean(axis=(1, 2)).max()
+        avg_temp    = weather[i, :, 1].mean()
         heat_stress = max(0.0, float(avg_temp) - 32.0)
 
+        # Normalise rain to [0,1] range (optimal ~800mm seasonal total)
+        rain_factor = float(np.clip(total_rain / 800.0, 0.3, 1.5))
+
         yield_val = (
-            BASE_YIELDS[crop_class]
-            + 1.2  * field_health          # spatial signal  → CNN learns
-            + 0.8  * peak_ndvi             # NDVI signal     → CNN learns
-            + 0.003 * total_rain           # rainfall signal → LSTM learns
-            - 0.10 * heat_stress           # heat penalty    → LSTM learns
-            - 0.18 * num_stress            # stress patches  → CNN learns
-            + float(rng.normal(0, 0.12))   # small noise only
+            BASE_YIELDS[crop_class]            # base: 3.5 / 4.2 / 5.1
+            + 1.5  * field_health              # spatial signal  → CNN learns  (+0 to +1.5)
+            + 1.0  * peak_ndvi                 # NDVI signal     → CNN learns  (+0 to +1.0)
+            + 0.8  * rain_factor               # rainfall signal → LSTM learns (+0.24 to +1.2)
+            - 0.15 * heat_stress               # heat penalty    → LSTM learns
+            - 0.20 * num_stress                # stress patches  → CNN learns  (-0 to -1.2)
+            + float(rng.normal(0, 0.10))       # small noise only
         )
-        yields[i] = float(np.clip(yield_val, 0.5, 12.0))
+        yields[i] = float(np.clip(yield_val, 0.5, 9.0))
 
         if (i + 1) % 200 == 0:
             print(f"  {i+1}/{NUM_FIELDS} fields processed ...")
