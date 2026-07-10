@@ -19,8 +19,8 @@ from src.data_preprocessing import load_data, split_data
 from src.feature_engineering import prepare_features
 from src.cnn_model import build_standalone_cnn
 from src.lstm_model import build_standalone_lstm
-from src.fusion_model import build_fusion_model
 from src.utils import set_seeds, create_output_dirs, log_experiment
+from keras import layers, Model, Input
 
 
 def get_callbacks(model_name):
@@ -120,16 +120,73 @@ def main():
     if h:
         histories["standalone_lstm"] = h
 
-    # 3. Fusion model
-    fusion = build_fusion_model(img_shape, wx_shape)
-    h = train_deep_model(
-        fusion,
-        [img_tr, wx_tr], y_tr,
-        [img_val, wx_val], y_val,
-        "fusion_model"
-    )
-    if h:
-        histories["fusion_model"] = h
+    # 3. Fusion model — attention-gated, two-phase training
+    fusion_path = os.path.join(MODEL_DIR, "fusion_model.keras")
+    if os.path.exists(fusion_path):
+        print(f"[SKIP] fusion_model already trained at {fusion_path}")
+    else:
+        print(f"\n{'='*50}\nTraining fusion_model...\n{'='*50}")
+        T, H, W, C = img_shape
+        _, F = wx_shape
+
+        def _cnn_enc():
+            inp = Input(shape=(H, W, C))
+            x = layers.Conv2D(32, 3, padding="same")(inp)
+            x = layers.BatchNormalization()(x); x = layers.ReLU()(x); x = layers.MaxPooling2D(2)(x)
+            x = layers.Conv2D(64, 3, padding="same")(x)
+            x = layers.BatchNormalization()(x); x = layers.ReLU()(x); x = layers.MaxPooling2D(2)(x)
+            x = layers.Conv2D(128, 3, padding="same")(x)
+            x = layers.BatchNormalization()(x); x = layers.ReLU()(x)
+            x = layers.GlobalAveragePooling2D()(x)
+            return Model(inp, layers.Dense(128, activation="relu")(x), name="cnn_enc")
+
+        from config import DROPOUT_RATE, LEARNING_RATE
+        img_inp = Input(shape=img_shape, name="image_input")
+        sp_seq  = layers.TimeDistributed(_cnn_enc(), name="td_cnn")(img_inp)
+        sp_feat = layers.LSTM(64, name="spatial_lstm")(sp_seq)
+        sp_proj = layers.Dense(64, activation="relu", name="cnn_proj")(sp_feat)
+
+        wx_inp  = Input(shape=wx_shape, name="weather_input")
+        x2      = layers.Masking(mask_value=0.0)(wx_inp)
+        x2      = layers.LSTM(128, return_sequences=True)(x2)
+        x2      = layers.Dropout(DROPOUT_RATE)(x2)
+        x2      = layers.LSTM(64)(x2)
+        x2      = layers.Dropout(DROPOUT_RATE)(x2)
+        wx_feat = layers.Dense(64, activation="relu", name="lstm_proj")(x2)
+
+        gate_in = layers.Concatenate(name="gate_input")([sp_proj, wx_feat])
+        gate    = layers.Dense(2, activation="softmax", name="branch_gate")(gate_in)
+        cnn_w   = layers.Lambda(lambda g: g[:, 0:1], name="cnn_weight")(gate)
+        lstm_w  = layers.Lambda(lambda g: g[:, 1:2], name="lstm_weight")(gate)
+        fused   = layers.Concatenate(name="fusion")(
+            [layers.Multiply(name="cnn_scaled")([sp_proj, cnn_w]),
+             layers.Multiply(name="lstm_scaled")([wx_feat, lstm_w])]
+        )
+        x = layers.Dense(128, activation="relu")(fused)
+        x = layers.Dropout(DROPOUT_RATE)(x)
+        x = layers.Dense(64, activation="relu")(x)
+        out = layers.Dense(1, activation="linear", name="yield_output")(x)
+        fusion = Model(inputs=[img_inp, wx_inp], outputs=out, name="fusion_model")
+
+        # Phase 1: freeze CNN branch, warm up LSTM + gate
+        for layer in fusion.layers:
+            if layer.name in ("td_cnn", "spatial_lstm", "cnn_proj"):
+                layer.trainable = False
+        fusion.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE), loss="mse", metrics=["mae"])
+        print("Phase 1: warming up LSTM branch (CNN frozen)...")
+        fusion.fit([img_tr, wx_tr], y_tr, validation_data=([img_val, wx_val], y_val),
+                   epochs=20, batch_size=BATCH_SIZE, verbose=1)
+
+        # Phase 2: unfreeze all, joint fine-tune at lower LR
+        for layer in fusion.layers:
+            layer.trainable = True
+        fusion.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE * 0.3), loss="mse", metrics=["mae"])
+        print("Phase 2: joint fine-tuning (all layers unfrozen)...")
+        h = fusion.fit([img_tr, wx_tr], y_tr, validation_data=([img_val, wx_val], y_val),
+                       epochs=EPOCHS, batch_size=BATCH_SIZE,
+                       callbacks=get_callbacks("fusion_model"), verbose=1)
+        fusion.save(fusion_path)
+        histories["fusion_model"] = {k: [float(v) for v in vals] for k, vals in h.history.items()}
 
     # 4. Random Forest
     rf = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
