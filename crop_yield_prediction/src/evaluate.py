@@ -30,7 +30,7 @@ def load_all_models():
     for name in ["standalone_cnn", "standalone_lstm", "fusion_model"]:
         path = os.path.join(MODEL_DIR, f"{name}.keras")
         if os.path.exists(path):
-            models[name] = keras.models.load_model(path)
+            models[name] = keras.models.load_model(path, safe_mode=False)
             print(f"Loaded {name}")
     for name in ["random_forest", "svr"]:
         path = os.path.join(MODEL_DIR, f"{name}.pkl")

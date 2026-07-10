@@ -21,6 +21,22 @@ from src.cnn_model import build_standalone_cnn
 from src.lstm_model import build_standalone_lstm
 from src.utils import set_seeds, create_output_dirs, log_experiment
 from keras import layers, Model, Input
+import keras
+
+
+@keras.saving.register_keras_serializable()
+class SliceChannel(layers.Layer):
+    """Slices a single column from a 2-D tensor: output = input[:, index:index+1]."""
+    def __init__(self, index, **kwargs):
+        super().__init__(**kwargs)
+        self.index = index
+
+    def call(self, x):
+        return x[:, self.index:self.index + 1]
+
+    def get_config(self):
+        return {**super().get_config(), "index": self.index}
+
 
 
 def get_callbacks(model_name):
@@ -156,8 +172,8 @@ def main():
 
         gate_in = layers.Concatenate(name="gate_input")([sp_proj, wx_feat])
         gate    = layers.Dense(2, activation="softmax", name="branch_gate")(gate_in)
-        cnn_w   = layers.Lambda(lambda g: g[:, 0:1], name="cnn_weight")(gate)
-        lstm_w  = layers.Lambda(lambda g: g[:, 1:2], name="lstm_weight")(gate)
+        cnn_w   = SliceChannel(0, name="cnn_weight")(gate)
+        lstm_w  = SliceChannel(1, name="lstm_weight")(gate)
         fused   = layers.Concatenate(name="fusion")(
             [layers.Multiply(name="cnn_scaled")([sp_proj, cnn_w]),
              layers.Multiply(name="lstm_scaled")([wx_feat, lstm_w])]
