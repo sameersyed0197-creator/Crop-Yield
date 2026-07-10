@@ -5,7 +5,7 @@ import numpy as np
 import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR
-from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import keras
@@ -18,11 +18,14 @@ from config import (
     LEARNING_RATE
 )
 from src.data_preprocessing import load_data, split_data
-from src.feature_engineering import prepare_features
+from src.feature_engineering import (
+    prepare_features, normalize_images, normalize_weather,
+    compute_vegetation_indices, extract_temporal_stats, create_ml_features
+)
 from src.cnn_model import build_standalone_cnn
 from src.lstm_model import build_standalone_lstm
 from src.fusion_model import build_fusion_model
-from src.utils import set_seeds, create_output_dirs, log_experiment, compute_metrics, format_results_table
+from src.utils import set_seeds, create_output_dirs, log_experiment, compute_metrics
 
 
 def cosine_schedule(total_epochs, lr_start, lr_min=1e-6):
@@ -81,27 +84,28 @@ def train_fusion_two_phase(img_tr, wx_tr, y_tr, img_val, wx_val, y_val,
     print(f"\n{'='*50}\nTraining fusion_model (two-phase)\n{'='*50}")
     fusion = build_fusion_model(img_shape, wx_shape)
 
-    # ── Phase 1: freeze td_cnn, train LSTM + attention + head (30 epochs, lr=0.001) ──
+    # Phase 1: freeze td_cnn, warm LSTM + attention + head (30 ep, lr=0.001)
     for layer in fusion.layers:
         if "td_cnn" in layer.name:
             layer.trainable = False
     fusion.compile(optimizer=keras.optimizers.Adam(0.001), loss="mse", metrics=["mae"])
-    print("\nPhase 1 (30 ep, lr=0.001): CNN frozen — warming LSTM + fusion head ...")
+    print("\nPhase 1 (30 ep): CNN frozen ...")
     fusion.fit(
         [img_tr, wx_tr], y_tr,
         validation_data=([img_val, wx_val], y_val),
         epochs=30, batch_size=BATCH_SIZE,
         callbacks=[EarlyStopping(monitor="val_loss", patience=8,
                                  restore_best_weights=True, verbose=1),
-                   keras.callbacks.LearningRateScheduler(cosine_schedule(30, 0.001), verbose=0)],
+                   keras.callbacks.LearningRateScheduler(
+                       cosine_schedule(30, 0.001), verbose=0)],
         verbose=1,
     )
 
-    # ── Phase 2: unfreeze all, joint fine-tune (70 epochs, lr=0.0001) ──
+    # Phase 2: unfreeze all, joint fine-tune (70 ep, lr=0.0001)
     for layer in fusion.layers:
         layer.trainable = True
     fusion.compile(optimizer=keras.optimizers.Adam(0.0001), loss="mse", metrics=["mae"])
-    print("\nPhase 2 (70 ep, lr=0.0001): all layers unfrozen — joint fine-tune ...")
+    print("\nPhase 2 (70 ep): all layers unfrozen ...")
     h = fusion.fit(
         [img_tr, wx_tr], y_tr,
         validation_data=([img_val, wx_val], y_val),
@@ -112,74 +116,55 @@ def train_fusion_two_phase(img_tr, wx_tr, y_tr, img_val, wx_val, y_val,
         verbose=1,
     )
     fusion.save(fusion_path)
-    print(f"Saved fusion_model")
+    print("Saved fusion_model")
     histories["fusion_model"] = {k: [float(v) for v in vals] for k, vals in h.history.items()}
-
-
-def print_comparison_table(models_dict, img_te, wx_te, ml_te, y_te):
-    """Load all models, predict on test set, print final comparison table."""
-    print("\n" + "=" * 62)
-    print(f"{'Model':<22} {'RMSE':>8} {'MAE':>8} {'R²':>8} {'MAPE%':>8}")
-    print("-" * 62)
-    results = {}
-    order = ["standalone_cnn", "standalone_lstm", "fusion_model", "random_forest", "svr"]
-    for name in order:
-        path_k = os.path.join(MODEL_DIR, f"{name}.keras")
-        path_p = os.path.join(MODEL_DIR, f"{name}.pkl")
-        try:
-            if os.path.exists(path_k):
-                m = keras.models.load_model(path_k, safe_mode=False)
-                if name == "fusion_model":
-                    pred = m.predict([img_te, wx_te], verbose=0).flatten()
-                elif name == "standalone_cnn":
-                    pred = m.predict(img_te, verbose=0).flatten()
-                else:
-                    pred = m.predict(wx_te, verbose=0).flatten()
-            elif os.path.exists(path_p):
-                m = joblib.load(path_p)
-                pred = m.predict(ml_te)
-            else:
-                continue
-            metrics = compute_metrics(y_te, pred)
-            results[name] = metrics
-            print(f"{name:<22} {metrics['RMSE']:>8.4f} {metrics['MAE']:>8.4f} "
-                  f"{metrics['R2']:>8.4f} {metrics['MAPE']:>8.2f}")
-        except Exception as e:
-            print(f"{name:<22} ERROR: {e}")
-    print("=" * 62)
-    return results
 
 
 def main():
     set_seeds(RANDOM_SEED)
     create_output_dirs()
 
+    # ── Load full dataset ─────────────────────────────────────────────────
     print("\n[Step 1] Loading data...")
     images, weather, yields, crop_labels = load_data()
+    print(f"  Yield stats — min:{yields.min():.2f}  max:{yields.max():.2f}  mean:{yields.mean():.2f}  std:{yields.std():.2f}")
+
+    # ── Fit ALL scalers on FULL dataset before splitting ──────────────────
+    # This prevents train-subset range mismatch in MinMaxScaler / StandardScaler
+    print("\n[Step 2] Fitting scalers on full dataset ...")
+    _, _, _, _, img_sc, wx_sc = prepare_features(images, weather, fit_scalers=True)
+
+    # Yield scaler — fit on full yields, save for inverse-transform in evaluate
+    yield_sc = StandardScaler()
+    yield_sc.fit(yields.reshape(-1, 1))
+    joblib.dump(yield_sc, os.path.join(MODEL_DIR, "yield_scaler.pkl"))
+    print(f"  Yield scaler saved. Scaled range: "
+          f"{yield_sc.transform([[yields.min()]])[0,0]:.2f} – "
+          f"{yield_sc.transform([[yields.max()]])[0,0]:.2f}")
+
+    # ── Split ─────────────────────────────────────────────────────────────
     splits = split_data(images, weather, yields, crop_labels)
 
-    print("\n[Step 2] Preparing features...")
-    img_tr, wx_tr, ml_tr, _, img_sc, wx_sc = prepare_features(
-        splits["train"]["images"], splits["train"]["weather"], fit_scalers=True
-    )
-
+    # ── Apply scalers to each split ───────────────────────────────────────
     def scale_split(split):
-        from src.feature_engineering import (
-            normalize_images, normalize_weather,
-            compute_vegetation_indices, extract_temporal_stats, create_ml_features
-        )
-        img_n, _ = normalize_images(split["images"], fit=False, scaler=img_sc)
-        wx_n, _  = normalize_weather(split["weather"], fit=False, scaler=wx_sc)
+        img_n, _ = normalize_images(split["images"],  fit=False, scaler=img_sc)
+        wx_n,  _ = normalize_weather(split["weather"], fit=False, scaler=wx_sc)
         ndvi, _  = compute_vegetation_indices(split["images"])
         stats    = extract_temporal_stats(ndvi)
         ml       = create_ml_features(stats, wx_n)
-        return img_n, wx_n, ml
+        # Scale yields
+        y_sc = yield_sc.transform(split["yields"].reshape(-1, 1)).flatten().astype(np.float32)
+        return img_n, wx_n, ml, y_sc
 
-    img_val, wx_val, ml_val = scale_split(splits["val"])
-    img_te,  wx_te,  ml_te  = scale_split(splits["test"])
-    y_tr  = splits["train"]["yields"]
-    y_val = splits["val"]["yields"]
-    y_te  = splits["test"]["yields"]
+    img_tr,  wx_tr,  ml_tr,  y_tr  = scale_split(splits["train"])
+    img_val, wx_val, ml_val, y_val = scale_split(splits["val"])
+    img_te,  wx_te,  ml_te,  y_te  = scale_split(splits["test"])
+
+    # Raw (unscaled) test yields for final metrics
+    y_te_raw = splits["test"]["yields"]
+
+    print(f"  Train yields (scaled): min={y_tr.min():.2f}  max={y_tr.max():.2f}")
+    print(f"  Test  yields (scaled): min={y_te.min():.2f}  max={y_te.max():.2f}")
 
     img_shape = (SEQUENCE_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH, NUM_BANDS + 2)
     wx_shape  = (SEQUENCE_LENGTH, NUM_WEATHER_FEATURES)
@@ -205,12 +190,12 @@ def main():
     train_fusion_two_phase(img_tr, wx_tr, y_tr, img_val, wx_val, y_val,
                            img_shape, wx_shape, histories)
 
-    # 4. Random Forest
+    # 4. Random Forest (trained on scaled yields)
     rf = RandomForestRegressor(n_estimators=300, max_features="sqrt",
                                random_state=RANDOM_SEED, n_jobs=-1)
     train_sklearn_model(rf, ml_tr, y_tr, "random_forest")
 
-    # 5. SVR
+    # 5. SVR (trained on scaled yields)
     svr = SVR(kernel="rbf", C=10, epsilon=0.1)
     train_sklearn_model(svr, ml_tr, y_tr, "svr")
 
@@ -223,11 +208,42 @@ def main():
         {"models_trained": list(histories.keys())}
     )
 
-    print("\n[Final] Comparison table on held-out test set:")
-    results = print_comparison_table({}, img_te, wx_te, ml_te, y_te)
+    # ── Final comparison table (inverse-transform predictions back to t/ha) ──
+    print("\n[Final] Comparison table on held-out test set (original t/ha scale):")
+    print("=" * 62)
+    print(f"{'Model':<22} {'RMSE':>8} {'MAE':>8} {'R²':>8} {'MAPE%':>8}")
+    print("-" * 62)
 
-    # Save results CSV
     import pandas as pd
+    results = {}
+    order = ["standalone_cnn", "standalone_lstm", "fusion_model", "random_forest", "svr"]
+    for name in order:
+        path_k = os.path.join(MODEL_DIR, f"{name}.keras")
+        path_p = os.path.join(MODEL_DIR, f"{name}.pkl")
+        try:
+            if os.path.exists(path_k):
+                m = keras.models.load_model(path_k, safe_mode=False)
+                if name == "fusion_model":
+                    pred_sc = m.predict([img_te, wx_te], verbose=0).flatten()
+                elif name == "standalone_cnn":
+                    pred_sc = m.predict(img_te, verbose=0).flatten()
+                else:
+                    pred_sc = m.predict(wx_te, verbose=0).flatten()
+            elif os.path.exists(path_p):
+                m = joblib.load(path_p)
+                pred_sc = m.predict(ml_te)
+            else:
+                continue
+            # Inverse-transform to original t/ha scale
+            pred_orig = yield_sc.inverse_transform(pred_sc.reshape(-1, 1)).flatten()
+            metrics = compute_metrics(y_te_raw, pred_orig)
+            results[name] = metrics
+            print(f"{name:<22} {metrics['RMSE']:>8.4f} {metrics['MAE']:>8.4f} "
+                  f"{metrics['R2']:>8.4f} {metrics['MAPE']:>8.2f}")
+        except Exception as e:
+            print(f"{name:<22} ERROR: {e}")
+    print("=" * 62)
+
     df_res = pd.DataFrame(results).T
     df_res.index.name = "Model"
     df_res.to_csv(os.path.join(RESULTS_DIR, "all_model_results.csv"))

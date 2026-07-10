@@ -6,7 +6,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
 import joblib
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -25,7 +24,6 @@ plt.rcParams.update({"font.family": "DejaVu Serif", "font.size": 11})
 
 
 def load_all_models():
-    """Load all trained models from disk."""
     models = {}
     for name in ["standalone_cnn", "standalone_lstm", "fusion_model"]:
         path = os.path.join(MODEL_DIR, f"{name}.keras")
@@ -41,49 +39,71 @@ def load_all_models():
 
 
 def get_test_data():
-    """Load and prepare test split."""
+    """
+    Load test split and apply the SAME scalers used during training.
+    Returns raw (t/ha) y_te and yield_sc so predictions can be inverse-transformed.
+    """
     images, weather, yields, crop_labels = load_data()
     splits = split_data(images, weather, yields, crop_labels)
 
-    img_sc = joblib.load(os.path.join(MODEL_DIR, "image_scaler.pkl"))
-    wx_sc  = joblib.load(os.path.join(MODEL_DIR, "weather_scaler.pkl"))
+    img_sc   = joblib.load(os.path.join(MODEL_DIR, "image_scaler.pkl"))
+    wx_sc    = joblib.load(os.path.join(MODEL_DIR, "weather_scaler.pkl"))
+    yield_sc = joblib.load(os.path.join(MODEL_DIR, "yield_scaler.pkl"))
 
-    img_te, _ = normalize_images(splits["test"]["images"], fit=False, scaler=img_sc)
+    img_te, _ = normalize_images(splits["test"]["images"],  fit=False, scaler=img_sc)
     wx_te, _  = normalize_weather(splits["test"]["weather"], fit=False, scaler=wx_sc)
+
     ndvi, _   = compute_vegetation_indices(splits["test"]["images"])
     stats     = extract_temporal_stats(ndvi)
     ml_te     = create_ml_features(stats, wx_te)
-    y_te      = splits["test"]["yields"]
 
-    # For NDVI seasonal plot use full dataset
-    ndvi_all, _ = compute_vegetation_indices(images)
-    ndvi_spatial_mean = ndvi_all.mean(axis=(2, 3))  # (N, T)
+    # y_te stays in original t/ha — metrics computed on this
+    y_te_raw  = splits["test"]["yields"]
 
-    return img_te, wx_te, ml_te, y_te, ndvi_spatial_mean, splits["test"]["crop_labels"]
+    # NDVI seasonal plot uses full dataset
+    img_all, _        = normalize_images(images, fit=False, scaler=img_sc)
+    ndvi_all, _       = compute_vegetation_indices(img_all)
+    ndvi_spatial_mean = ndvi_all.mean(axis=(2, 3))
+
+    return img_te, wx_te, ml_te, y_te_raw, ndvi_spatial_mean, splits["test"]["crop_labels"], yield_sc
 
 
-def predict_all(models, img_te, wx_te, ml_te):
-    """Generate predictions from all models."""
+def predict_all(models, img_te, wx_te, ml_te, yield_sc):
+    """
+    Get predictions from all models and inverse-transform to original t/ha scale.
+    Models were trained on scaled yields so raw output is in scaled space.
+    """
     preds = {}
+
+    def inv(p):
+        return yield_sc.inverse_transform(
+            np.array(p).flatten().reshape(-1, 1)
+        ).flatten()
+
     if "standalone_cnn" in models:
-        preds["standalone_cnn"] = models["standalone_cnn"].predict(img_te, verbose=0).flatten()
+        preds["standalone_cnn"] = inv(
+            models["standalone_cnn"].predict(img_te, verbose=0).flatten()
+        )
     if "standalone_lstm" in models:
-        preds["standalone_lstm"] = models["standalone_lstm"].predict(wx_te, verbose=0).flatten()
+        preds["standalone_lstm"] = inv(
+            models["standalone_lstm"].predict(wx_te, verbose=0).flatten()
+        )
     if "fusion_model" in models:
-        preds["fusion_model"] = models["fusion_model"].predict([img_te, wx_te], verbose=0).flatten()
+        preds["fusion_model"] = inv(
+            models["fusion_model"].predict([img_te, wx_te], verbose=0).flatten()
+        )
     if "random_forest" in models:
-        preds["random_forest"] = models["random_forest"].predict(ml_te)
+        preds["random_forest"] = inv(models["random_forest"].predict(ml_te))
     if "svr" in models:
-        preds["svr"] = models["svr"].predict(ml_te)
+        preds["svr"] = inv(models["svr"].predict(ml_te))
+
     return preds
 
 
 def plot_comparison_table(results, save_path):
-    """Save model comparison table as PNG."""
     df = pd.DataFrame(results).T.reset_index()
     df.columns = ["Model", "RMSE", "MAE", "R²", "MAPE%"]
     df = df.round(4)
-
     fig, ax = plt.subplots(figsize=(9, 3))
     ax.axis("off")
     tbl = ax.table(cellText=df.values, colLabels=df.columns, loc="center", cellLoc="center")
@@ -98,7 +118,6 @@ def plot_comparison_table(results, save_path):
 
 
 def plot_predicted_vs_actual(y_true, y_pred, save_path):
-    """Scatter plot of predicted vs actual yield."""
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(y_true, y_pred, alpha=0.5, s=20, color="steelblue", label="Predictions")
     lims = [min(y_true.min(), y_pred.min()) - 0.2, max(y_true.max(), y_pred.max()) + 0.2]
@@ -114,7 +133,6 @@ def plot_predicted_vs_actual(y_true, y_pred, save_path):
 
 
 def plot_training_curves(histories, save_path):
-    """Plot train/val loss curves for deep models."""
     deep_models = ["standalone_cnn", "standalone_lstm", "fusion_model"]
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     for ax, name in zip(axes, deep_models):
@@ -136,11 +154,9 @@ def plot_training_curves(histories, save_path):
 
 
 def plot_ndvi_seasonal(ndvi_spatial_mean, save_path):
-    """Plot mean ± std NDVI curve across growing season."""
     mean_curve = ndvi_spatial_mean.mean(axis=0)
     std_curve  = ndvi_spatial_mean.std(axis=0)
     weeks = np.arange(1, len(mean_curve) + 1)
-
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(weeks, mean_curve, color="green", linewidth=2, label="Mean NDVI")
     ax.fill_between(weeks, mean_curve - std_curve, mean_curve + std_curve,
@@ -156,14 +172,12 @@ def plot_ndvi_seasonal(ndvi_spatial_mean, save_path):
 
 
 def plot_feature_importance(models, save_path):
-    """Bar chart of Random Forest feature importance."""
     if "random_forest" not in models:
         return
     rf = models["random_forest"]
     importances = rf.feature_importances_
     top_n = min(20, len(importances))
     idx = np.argsort(importances)[::-1][:top_n]
-
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.bar(range(top_n), importances[idx], color="olivedrab")
     ax.set_xticks(range(top_n))
@@ -177,7 +191,6 @@ def plot_feature_importance(models, save_path):
 
 
 def plot_yield_distribution(y_true, y_pred, save_path):
-    """Histogram of predicted vs actual yield."""
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(y_true, bins=30, alpha=0.6, color="steelblue", label="Actual")
     ax.hist(y_pred, bins=30, alpha=0.6, color="darkorange", label="Predicted")
@@ -198,16 +211,20 @@ def main():
     models = load_all_models()
 
     print("\n[Step 2] Preparing test data...")
-    img_te, wx_te, ml_te, y_te, ndvi_spatial_mean, _ = get_test_data()
+    img_te, wx_te, ml_te, y_te, ndvi_spatial_mean, _, yield_sc = get_test_data()
+    print(f"  y_te range: min={y_te.min():.2f}  max={y_te.max():.2f}  mean={y_te.mean():.2f}")
 
-    print("\n[Step 3] Generating predictions...")
-    preds = predict_all(models, img_te, wx_te, ml_te)
+    print("\n[Step 3] Generating predictions (inverse-transformed to t/ha)...")
+    preds = predict_all(models, img_te, wx_te, ml_te, yield_sc)
+
+    # Sanity check — print raw prediction ranges
+    for name, p in preds.items():
+        print(f"  {name}: pred min={p.min():.2f}  max={p.max():.2f}  mean={p.mean():.2f}")
 
     print("\n[Step 4] Computing metrics...")
     results = {name: compute_metrics(y_te, p) for name, p in preds.items()}
     format_results_table(results)
 
-    # Save CSV
     df = pd.DataFrame(results).T
     df.index.name = "Model"
     csv_path = os.path.join(RESULTS_DIR, "all_model_results.csv")
@@ -218,8 +235,10 @@ def main():
     plot_comparison_table(results, os.path.join(PLOT_DIR, "comparison_table.png"))
 
     if "fusion_model" in preds:
-        plot_predicted_vs_actual(y_te, preds["fusion_model"], os.path.join(PLOT_DIR, "predicted_vs_actual.png"))
-        plot_yield_distribution(y_te, preds["fusion_model"], os.path.join(PLOT_DIR, "yield_distribution.png"))
+        plot_predicted_vs_actual(y_te, preds["fusion_model"],
+                                 os.path.join(PLOT_DIR, "predicted_vs_actual.png"))
+        plot_yield_distribution(y_te, preds["fusion_model"],
+                                os.path.join(PLOT_DIR, "yield_distribution.png"))
 
     hist_path = os.path.join(RESULTS_DIR, "training_histories.json")
     if os.path.exists(hist_path):
